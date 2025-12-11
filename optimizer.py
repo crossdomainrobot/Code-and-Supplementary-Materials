@@ -1,38 +1,58 @@
-# @File : optimizer2 .py
-# @File : optimizer_height.py
-import os
+﻿import os
 import re
 import numpy as np
 import sys
 from openai import OpenAI
+import TextGrad as tg
+from TextGrad.tasks import load_task
 
-# ================== 日志目录 ===================
-LOG_DIR = r"D:\Aresearch\雪车论文\雪车论文2\数据\OPRO_distributed\22_comparision_SDS_textgrad"
+LOG_DIR = r"D:\Aresearch\闆溅璁烘枃\闆溅璁烘枃2\鏁版嵁\OPRO_distributed\22_comparision_SDS_textgrad"
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ================== 阶段配置（对应 Table 1） ===================
 STAGE_STEP_CONFIG = {
     "early": {
-        "min_abs_step": 0.0,    # 表 1: [-4, 4]，最小可为 0
+        "min_abs_step": 0.0,
         "max_abs_step": 4.0,
     },
     "mid": {
-        "min_abs_step": 0.001,  # 表 1: [0.001, 1]
+        "min_abs_step": 0.001,
         "max_abs_step": 1.0,
     },
     "late": {
-        "min_abs_step": 0.001,  # 表 1: [0.001, 0.1]
+        "min_abs_step": 0.001,
         "max_abs_step": 0.1,
     },
 }
 
 
-# ================== 一些基础函数 ===================
+
+class LanguageGradientEngine:
+    def __init__(self, client, model_name: str):
+        self.client = client
+        self.model_name = model_name
+
+    def __call__(self, prompt: str, system_prompt: str = None) -> str:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        resp = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            stream=False,
+        )
+        return resp.choices[0].message.content
+
+
+def build_textgrad_task():
+    try:
+        return load_task("numeric-optimization")
+    except Exception:
+        return None
+
+
 
 def compute_segment_distances(x_coord, y_coord, segment_points):
-    """
-    根据 2D 轨迹和每段的点数，计算每个 segment 的水平距离。
-    """
     n_segments = len(segment_points)
     distances = np.zeros(n_segments)
     for i in range(n_segments):
@@ -45,10 +65,6 @@ def compute_segment_distances(x_coord, y_coord, segment_points):
 
 
 def extract_first_float(text: str) -> float:
-    """
-    从 LLM 输出中抽取第一个浮点数。
-    如果没抽到，就抛异常。
-    """
     pattern = r'-?\d+(?:\.\d+)?'
     m = re.search(pattern, text)
     if not m:
@@ -57,10 +73,6 @@ def extract_first_float(text: str) -> float:
 
 
 def extract_stage_label(text: str) -> str:
-    """
-    从 LLM 输出中抽取阶段标签：early / mid / late
-    如果没抽到，就默认 early。
-    """
     low = text.lower()
     if "late" in low:
         return "late"
@@ -69,12 +81,8 @@ def extract_stage_label(text: str) -> str:
     return "early"
 
 
-# ================== 轨道 cost 函数实现 ===================
 
 def build_z_from_height_differences(x, y, segment_points, height_differences, H_target):
-    """
-    根据每段的高度差，构造 z 坐标。
-    """
     n = len(x)
     z = np.zeros_like(x)
 
@@ -102,21 +110,15 @@ def compute_full_cost(
     max_slope=0.204,
     mean_slope=0.116,
 ):
-    """
-    完整 cost 函数（与 prompt 思路一致：长度/落差=硬边界+软偏好；坡度超限软化）。
-    返回 cost 和若干中间量（方便 debug）。
-    """
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     height_differences = np.asarray(height_differences, dtype=float)
     n = len(x)
 
-    # ================== 构造 z 坐标 ===================
     z = build_z_from_height_differences(x, y, segment_points,
                                         height_differences, H_target)
 
-    # ================== 一阶/二阶导数 + 曲率 ===================
     dx1 = np.zeros(n); dy1 = np.zeros(n); dz = np.zeros(n)
     ddx = np.zeros(n); ddy = np.zeros(n); ddz = np.zeros(n)
     curvature_2d = np.zeros(n); curvature_3d = np.zeros(n)
@@ -154,7 +156,6 @@ def compute_full_cost(
 
     curvature_difference_sum = np.sum(curvature_difference)
 
-    # ================== 坡度与均值 ===================
     distances1 = np.zeros(n)
     slope1 = np.zeros(n)
     for i in range(1, n):
@@ -165,17 +166,14 @@ def compute_full_cost(
         slope1[i] = (z[i-1] - z[i]) / (dist + 1e-8)
     slope_mean = np.sum(slope1) / n
 
-    # ================== 总长度与总落差 ===================
     segment_lengths = np.sqrt(np.diff(x)**2 + np.diff(y)**2 + np.diff(z)**2)
     total_length = np.sum(segment_lengths)
     current_height = np.sum(height_differences)
 
-    # ================== 分层代价 ===================
     def huber(r, delta):
         ar = np.abs(r)
         return np.where(ar <= delta, 0.5 * r**2, delta * (ar - 0.5 * delta))
 
-    # 长度：硬上界 + 软目标
     tau_L = 20.0
     L = total_length
     C_L_hard = (np.maximum(0.0, L - 1300.0) ** 2) / (1300.0 ** 2)
@@ -183,7 +181,6 @@ def compute_full_cost(
     wL_hard, wL_soft = 1.0, 0.2
     C_L = wL_hard * C_L_hard + wL_soft * C_L_soft
 
-    # 落差：硬区间 + 带状偏好
     H = current_height
     C_H_hard = (np.maximum(0.0, 120.0 - H) ** 2) / (120.0 ** 2) \
              + (np.maximum(0.0, H - 150.0) ** 2) / (150.0 ** 2)
@@ -192,18 +189,14 @@ def compute_full_cost(
     wH_hard, wH_band = 1.0, 0.4
     C_H = wH_hard * C_H_hard + wH_band * C_H_band
 
-    # 曲率差
     C_C = curvature_difference_sum / n
 
-    # 坡度超限软化
     smax = max_slope
     excess = np.maximum(0.0, np.abs(slope1) - smax)
     C_S = np.mean(excess ** 2) / (smax ** 2)
 
-    # 平均坡度偏差
     C_S_S = slope_mean - mean_slope
 
-    # 合成总 cost（外层乘 10000，让整体 cost 大一点）
     cost = 10000 * (
         0.25 * C_L
         + 0.35 * C_H
@@ -229,13 +222,8 @@ def compute_full_cost(
     )
 
 
-# ================== 构造给 LLM 的提示 ===================
 
 def build_system_prompt():
-    """
-    固定的 system prompt，不再训练它。
-    让模型扮演“基于 cost 的优化器”，专门优化第二段高度差。
-    """
     system_prompt = (
         " (Background) In bobsleigh races, athletes must steer the sled along a predefined track as quickly as possible to reach the finish line. "
         " (Background) The key characteristic of the track is mainly determined by its 3D centerline, which defines the length, curvature, slopes, and other features of the track. "
@@ -360,14 +348,14 @@ def build_system_prompt():
         "        C_H_band=C_H_band,"
         "    )"
 
-        " print(f\"\\n✅ Cost = {cost:.6f}\") "
-        " # ================== End of Code =================== "
+        " print(f\"\\n鉁?Cost = {cost:.6f}\") "
+        "
         " (Task) You need to understand how the cost is calculated and how the height differences influence the cost in the optimization process. "
         " (Task) Based on this understanding, you will optimize the 2nd height_differences. "
         " (Task) You should directly optimizing the 2nd segment. I trust you ability! "
         " Steps: "
         " (Step) 1. Optimize the 2nd element, which means you need to output only one element each time."
-        " (Step) 2. Iteratively optimize the 2nd height difference. During each iteration, the height difference may only change by ±4. Once the direction of convergence becomes clear, gradually reduce the step size. The final value must reach a precision of 0.001 and the final cost must less than 0.1. "
+        " (Step) 2. Iteratively optimize the 2nd height difference. During each iteration, the height difference may only change by 卤4. Once the direction of convergence becomes clear, gradually reduce the step size. The final value must reach a precision of 0.001 and the final cost must less than 0.1. "
         " (Step) 3. You are strictly forbidden to stop optimizing a segment unless both of the following conditions are fully and simultaneously satisfied: "
         "     (Condition A) The overall cost computed by the reference cost function is strictly less than 0.1. "
         "     (Condition B) The optimization for all segments has reached a step size less than or equal to 0.001. "
@@ -377,7 +365,7 @@ def build_system_prompt():
         " (Step) 4. Combine all optimized values to update the complete set of height_differences. "
         " Remember that the final value must reach a precision of 0.001. Please carefully think through the decomposition and optimization process step by step. "
         " Never say 'This is my final decision!' because once you say that, the program will treat it as the end"
-        "of the iteration. Just keep it in mind — there's no need to say anything like : we're still far from being able to say 'This is my final decision!' either."
+        "of the iteration. Just keep it in mind 鈥?there's no need to say anything like : we're still far from being able to say 'This is my final decision!' either."
         "Please think step by step"
     )
     return system_prompt
@@ -394,20 +382,13 @@ def build_formatted_input(
     max_abs_step,
     prev_summary=None,
 ):
-    """
-    把当前状态包装成 user prompt，发给“高度优化大模型”。
-    会包含：
-      - 当前阶段 stage
-      - 本阶段允许的步长区间 [min_abs_step, max_abs_step]
-      - 上一轮由大模型 C 凝练的 summary（若有）
-    """
     old_h2 = float(current_heights[segment_idx])
 
     common_tail = (
         f"\nStage & step constraints:\n"
         f"- Current stage: {stage}\n"
-        f"- Allowed step for this stage (Δ = new_h2 - old_h2): "
-        f"abs(Δ) ∈ [{min_abs_step:.3f}, {max_abs_step:.3f}]\n"
+        f"- Allowed step for this stage (螖 = new_h2 - old_h2): "
+        f"abs(螖) 鈭?[{min_abs_step:.3f}, {max_abs_step:.3f}]\n"
         f"- Current old_h2 = {old_h2:.6f}\n"
         f"- Current total cost = {current_cost:.6f}\n\n"
         "Task:\n"
@@ -415,7 +396,7 @@ def build_formatted_input(
         "- Based on the current heights, the cost, the stage-specific step-size constraint,\n"
         "  and the condensed summary of the previous iteration (if provided),\n"
         "  propose a NEW value for height_differences[1] (call it new_h2).\n"
-        "- The update step is Δ = new_h2 - old_h2, and you MUST ensure abs(Δ) is within the interval above.\n"
+        "- The update step is 螖 = new_h2 - old_h2, and you MUST ensure abs(螖) is within the interval above.\n"
         "- You MUST output only ONE floating-point number (no extra text, no explanation).\n"
         "- The number you output will be directly used as the new height_differences[1].\n"
     )
@@ -459,7 +440,6 @@ def build_formatted_input(
     return msg
 
 
-# ================== LLM 调用封装 ===================
 
 def call_llm_for_height(
     client,
@@ -467,9 +447,6 @@ def call_llm_for_height(
     system_prompt,
     user_text,
 ):
-    """
-    调用 qwen-plus 一次，返回一个 float（新的 height_differences[1]）。
-    """
     resp = client.chat.completions.create(
         model=model_name,
         messages=[
@@ -489,9 +466,6 @@ def call_llm_for_stage(
     iteration_idx,
     current_cost,
 ):
-    """
-    大模型 A：根据当前迭代次数 t 和 cost，判定当前处于 early/mid/late。
-    """
     system_prompt = (
         "You are a controller for an iterative optimization algorithm.\n"
         "Your only job is to decide which stage the optimization is currently in.\n"
@@ -550,10 +524,6 @@ def call_llm_for_iteration_summary(
     user_text,
     model_output,
 ):
-    """
-    大模型 C：对“上一轮的输入 + 输出”做凝练，总结成短文本，
-    供下一轮作为高层语义记忆使用。
-    """
     system_prompt = (
         "You are a summarizer for an iterative optimization process.\n"
         "Your goal is to concisely summarize ONE iteration of optimization\n"
@@ -561,11 +531,11 @@ def call_llm_for_iteration_summary(
         "The summary will be used as high-level memory for the NEXT iteration.\n"
         "Focus on:\n"
         "- the stage (early/mid/late),\n"
-        "- how the step (Δ = new_h2 - old_h2) changed the decision variable,\n"
+        "- how the step (螖 = new_h2 - old_h2) changed the decision variable,\n"
         "- how the cost changed (better or worse),\n"
         "- whether the direction seems promising or not.\n\n"
         "Requirements:\n"
-        "- Output 1–3 short sentences.\n"
+        "- Output 1鈥? short sentences.\n"
         "- Do NOT include any instructions to the next model.\n"
         "- Do NOT ask questions.\n"
         "- No bullet points, no markdown, just plain text.\n"
@@ -576,7 +546,7 @@ def call_llm_for_iteration_summary(
         f"Stage: {stage}\n"
         f"Old h2: {old_h2:.6f}\n"
         f"New h2: {new_h2:.6f}\n"
-        f"Step Δ = new_h2 - old_h2 = {step:.6f}\n"
+        f"Step 螖 = new_h2 - old_h2 = {step:.6f}\n"
         f"Previous cost: {old_cost:.6f}\n"
         f"New cost: {new_cost:.6f}\n\n"
         "Below is the optimizer input prompt used in this iteration:\n"
@@ -602,12 +572,74 @@ def call_llm_for_iteration_summary(
     return summary
 
 
-# ================== 主优化过程 ===================
+def optimize_h2_with_textgrad(
+    backward_engine,
+    textgrad_task,
+    x_coord,
+    y_coord,
+    segment_points,
+    current_heights,
+    segment_idx,
+    L_target,
+    H_target,
+):
+    old_h2_val = float(current_heights[segment_idx])
+    h2_var = tg.Variable(
+        f"{old_h2_val:.6f}",
+        requires_grad=True,
+        role_description="Textual scalar for height_differences[1]."
+    )
+
+    def eval_cost_var():
+        try:
+            proposed_h2 = float(h2_var.get_value())
+        except Exception:
+            return tg.Variable(
+                "1e6",
+                requires_grad=True,
+                role_description="Penalty because h2 was not parsed as float."
+            )
+        tmp_heights = np.array(current_heights, dtype=float).copy()
+        tmp_heights[segment_idx] = proposed_h2
+        cost_val, _ = compute_full_cost(
+            x_coord, y_coord, segment_points, tmp_heights,
+            L_target=L_target, H_target=H_target
+        )
+        return tg.Variable(
+            f"{float(cost_val):.10f}",
+            requires_grad=True,
+            role_description="Total track cost to be minimized."
+        )
+
+    optimizer = tg.TextualGradientDescent(
+        engine=backward_engine,
+        parameters=[h2_var],
+    )
+    optimizer.zero_grad()
+    loss_var = eval_cost_var()
+    try:
+        loss_var.backward(task=textgrad_task)
+    except Exception:
+        loss_var.backward()
+    try:
+        optimizer.step(task=textgrad_task)
+    except Exception:
+        optimizer.step()
+
+    raw_new = str(h2_var.get_value())
+    try:
+        new_h2_val = float(extract_first_float(raw_new))
+    except Exception:
+        new_h2_val = old_h2_val
+        raw_new = f"{old_h2_val:.6f}"
+
+    return raw_new, float(new_h2_val)
+
+
 
 def main():
-    prev_summary = None  # 上一轮的凝练文本
+    prev_summary = None
 
-    # ---------- 1. 读取数据 ----------
     data = np.loadtxt('../2-xy-www1.txt')
     x_coord = data[:, 0]
     y_coord = data[:, 1]
@@ -617,7 +649,6 @@ def main():
 
     n_segments = len(segment_points)
 
-    # ---------- 2. 计算按距离比例分配的初始高度差 ----------
     distances = compute_segment_distances(x_coord, y_coord, segment_points)
     total_distance = np.sum(distances)
     H_target = 138.3
@@ -626,9 +657,8 @@ def main():
     initial_height_differences = H_target * (distances / total_distance)
 
     current_heights = initial_height_differences.copy()
-    segment_idx = 1  # 只优化第 2 段（下标 1）
+    segment_idx = 1
 
-    # ---------- 3. 设置 DashScope 客户端 ----------
     DASHSCOPE_BASE_URL = os.getenv(
         "DASHSCOPE_BASE_URL",
         "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -636,18 +666,19 @@ def main():
     QWEN_PLUS_KEY = "sk-4af60e09c8fc4c01982bc5e089d24499"
 
     if QWEN_PLUS_KEY is None:
-        raise RuntimeError("请先在环境变量中设置 QWEN_PLUS_KEY 或直接在代码中填写。")
+        raise RuntimeError("璇峰厛鍦ㄧ幆澧冨彉閲忎腑璁剧疆 QWEN_PLUS_KEY 鎴栫洿鎺ュ湪浠ｇ爜涓～鍐欍€?)
 
     forward_client = OpenAI(
         api_key=QWEN_PLUS_KEY,
         base_url=DASHSCOPE_BASE_URL,
     )
     forward_model_name = "qwen-plus"
+    textgrad_task = build_textgrad_task()
+    backward_engine = LanguageGradientEngine(forward_client, forward_model_name)
+    use_textgrad = os.getenv("USE_TEXTGRAD", "1") != "0"
 
-    # ---------- 4. 固定 system prompt ----------
     system_prompt = build_system_prompt()
 
-    # ---------- 5. 计算初始 cost ----------
     current_cost, detail = compute_full_cost(
         x_coord, y_coord, segment_points, current_heights,
         L_target=L_target,
@@ -657,7 +688,6 @@ def main():
     print(f"Initial cost = {current_cost:.6f}")
     print(f"Initial heights: {current_heights.tolist()}")
 
-    # ---------- 6. 迭代优化高度 ----------
     max_iterations = 30
     cost_threshold = 0.1
     step_threshold = 0.001
@@ -668,7 +698,6 @@ def main():
 
     for it in range(1, max_iterations + 1):
 
-        # 0) 从 orchestrator 获取协同信息（如果有）
         coop_msg_file = r"D:\Pycharm\Bobsleigh\coop_msg_for_optimizer1.txt"
         if os.path.exists(coop_msg_file):
             with open(coop_msg_file, "r", encoding="utf-8") as f:
@@ -678,7 +707,6 @@ def main():
 
         old_cost = current_cost
 
-        # 6.1 判定阶段（大模型 A）
         stage, stage_raw = call_llm_for_stage(
             forward_client,
             forward_model_name,
@@ -691,7 +719,6 @@ def main():
         min_abs_step = stage_cfg["min_abs_step"]
         max_abs_step = stage_cfg["max_abs_step"]
 
-        # 6.2 构造发给“大模型 B（高度优化器）”的 user prompt
         user_text = build_formatted_input(
             initial_height_differences,
             current_heights,
@@ -704,32 +731,46 @@ def main():
             prev_summary=prev_summary,
         )
 
-        try:
-            new_h2_raw, raw_output = call_llm_for_height(
-                forward_client,
-                forward_model_name,
-                system_prompt,
-                user_text,
-            )
-        except Exception as e:
-            print(f"[Iter {it}] LLM 调用或解析失败：{e}")
-            break
+        if use_textgrad:
+            try:
+                raw_output, new_h2_raw = optimize_h2_with_textgrad(
+                    backward_engine=backward_engine,
+                    textgrad_task=textgrad_task,
+                    x_coord=x_coord,
+                    y_coord=y_coord,
+                    segment_points=segment_points,
+                    current_heights=current_heights,
+                    segment_idx=segment_idx,
+                    L_target=L_target,
+                    H_target=H_target,
+                )
+            except Exception as e:
+                print(f"[Iter {it}] TextGrad 浼樺寲鎴栬В鏋愬け璐ワ細{e}")
+                break
+        else:
+            try:
+                new_h2_raw, raw_output = call_llm_for_height(
+                    forward_client,
+                    forward_model_name,
+                    system_prompt,
+                    user_text,
+                )
+            except Exception as e:
+                print(f"[Iter {it}] LLM 璋冪敤鎴栬В鏋愬け璐ワ細{e}")
+                break
 
         old_h2 = current_heights[segment_idx]
         step = new_h2_raw - old_h2
         abs_step = abs(step)
 
-        # 阶段内最大步长约束
         if abs_step > max_abs_step:
             step = np.sign(step) * max_abs_step
             abs_step = max_abs_step
 
-        # 阶段内最小步长约束（early 允许 0）
         if (min_abs_step > 0.0) and (0.0 < abs_step < min_abs_step):
             step = np.sign(step) * min_abs_step
             abs_step = min_abs_step
 
-        # 全局物理约束：每一步变化不能超过 ±4
         if abs_step > 4.0:
             step = 4.0 * np.sign(step)
             abs_step = 4.0
@@ -740,7 +781,6 @@ def main():
 
         current_heights[segment_idx] = new_h2
 
-        # 6.5 更新 cost
         current_cost, detail = compute_full_cost(
             x_coord, y_coord, segment_points, current_heights,
             L_target=L_target,
@@ -758,7 +798,6 @@ def main():
                 f"{it},{stage},{current_cost:.6f},{new_h2:.6f},{step:.6f},{safe_raw}\n"
             )
 
-        # 6.6 大模型 C：对本轮迭代做凝练，供下一轮使用
         try:
             prev_summary = call_llm_for_iteration_summary(
                 forward_client,
@@ -774,10 +813,9 @@ def main():
                 model_output=raw_output,
             )
         except Exception as e:
-            print(f"[Iter {it}] 总结大模型调用失败：{e}")
+            print(f"[Iter {it}] 鎬荤粨澶фā鍨嬭皟鐢ㄥけ璐ワ細{e}")
             prev_summary = None
 
-        # 判断停止条件
         if (current_cost < cost_threshold) and (abs(step) <= step_threshold):
             print(
                 f"Converged at iter {it}: stage={stage}, cost={current_cost:.6f}, "
@@ -785,7 +823,6 @@ def main():
             )
             break
 
-    # ---------- 7. 打印最终结果 ----------
     print("Final heights:", current_heights.tolist())
     print(f"Final cost = {current_cost:.6f}")
     np.savetxt(
@@ -797,15 +834,9 @@ def main():
 
 
 if __name__ == "__main__":
-    """
-    两种模式：
-    - 正常模式：直接跑 main()，就是你现在的优化流程
-    - helper 模式：由 orchestrator_experiment.py 启动，只读取邻居上一轮的信息，打印一下就退出
-    """
     mode = os.getenv("COOP_MODE", "normal")
 
     if mode == "helper" or "--helper" in sys.argv:
-        # 这是“协同辅助”模式，不再跑完整优化，只是读取邻居上一轮的信息
         target_id = os.getenv("COOP_TARGET_ID", "?")
         prev_line = os.getenv("COOP_PREV_LINE", "")
 
@@ -813,7 +844,4 @@ if __name__ == "__main__":
         print(f"[{os.path.basename(__file__)}-helper] received previous iteration line:")
         print(prev_line)
     else:
-        # 正常模式，照常优化
         main()
-
-

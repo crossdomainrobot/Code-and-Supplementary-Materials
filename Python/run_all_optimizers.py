@@ -1,10 +1,12 @@
-import os
+﻿import os
 import time
 import threading
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Dict
 
 BASE_DIR = r"D:\Pycharm\Bobsleigh\Code"
+MAX_PARALLEL = int(os.getenv("MAX_OPT_PARALLEL", "8"))
 
 OPTIMIZER_SCRIPTS: Dict[int, str] = {
     idx: f"optimizer{idx}.py" for idx in range(1, 34)
@@ -19,16 +21,22 @@ class OptimizerWorker:
         self.lock = threading.Lock()
         self.last_iter_line: Optional[str] = None
         self.last_iter_index: int = -1
-    def launch(self):
+    def launch(self, base_env: Optional[Dict[str, str]] = None):
         with self.lock:
             if not os.path.exists(self.path):
                 print(f"[Manager] optimizer{self.idx} script not found: {self.path}")
                 self.status = "finished"
                 return
             print(f"[Manager] Launching optimizer{self.idx} ({self.filename}) ...")
+            env = os.environ.copy()
+            if base_env:
+                env.update(base_env)
+            env.setdefault("USE_TEXTGRAD", "1")
+            env.setdefault("TEXTGRAD_WORKER_ID", str(self.idx))
             self.process = subprocess.Popen(
                 ["python", self.path],
                 cwd=BASE_DIR,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -219,8 +227,10 @@ def main():
     workers: List[OptimizerWorker] = []
     for idx, script_name in OPTIMIZER_SCRIPTS.items():
         workers.append(OptimizerWorker(idx, script_name))
-    for w in workers:
-        w.launch()
+    shared_env = {"USE_TEXTGRAD": os.getenv("USE_TEXTGRAD", "1")}
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(workers))) as pool:
+        for w in workers:
+            pool.submit(w.launch, shared_env)
     print("[Manager] All optimizers launched.")
     monitor(workers)
     print("[Manager] All optimizers finished.")
